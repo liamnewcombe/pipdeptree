@@ -186,6 +186,13 @@ class DistPackage(Package):
         super(DistPackage, self).__init__(obj)
         self.version_spec = None
         self.req = req
+        # Metadata properties for filtered_graph
+        self.include = False
+        self.exclude = False
+        self.required_versions = set()
+        self.conflict_target = False
+        self.conflicted_reqs = set()
+        self.is_root = True
 
     def render_as_root(self, frozen):
         if not frozen:
@@ -241,6 +248,8 @@ class ReqPackage(Package):
     def __init__(self, obj, dist=None):
         super(ReqPackage, self).__init__(obj)
         self.dist = dist
+        # Metadata properties for filtered_graph
+        self.is_missing = False
 
     @property
     def version_spec(self):
@@ -285,6 +294,492 @@ class ReqPackage(Package):
                 'package_name': self.project_name,
                 'installed_version': self.installed_version,
                 'required_version': self.version_spec}
+
+
+########################################################################################
+
+
+class MissingPackage(Package):
+    """Placeholder package class for missing dependencies."""
+
+    def __init__(self, name=None):
+        # No super() as this is just a placeholder, not a real Package
+        self.project_name = name
+        self.key = name
+        self.include = True
+        self.exclude = False
+        self.conflict_target = True
+        self.conflicted_reqs = set()
+        self.required_versions = set()
+
+    @property
+    def version(self):
+        """Read only property, version can only be MISSING."""
+        return 'MISSING'
+
+    def from_req(self, req):
+        """Build a MissingPackage from a ReqPackage.
+        Labels your req as missing and builds a new MissingPackage.
+
+        :param ReqPackage req: The ReqPackage with no target DistPackage
+        :returns missing: A new MissingPackage matching the Req
+        :rtype MissingPackage
+        """
+        req.is_missing = True
+        self.key = req.key
+        self.project_name = req.project_name
+        if req.version_spec is not None:
+            self.required_versions.add(req.version_spec)
+        return self
+
+
+def _get_dist_package(tree, req, index=None):
+    """Helper, tries to find the DistPackage in the tree by name.
+
+    :param collections.OrderedDict tree: The tree to search
+    :param ReqPackage req: The required package to find a DistPackage for
+    :param dict index: The tree index, if available
+    :returns node: The tree DistPackage whose name was supplied or a MissingPackage
+    :rtype DistPackage
+    """
+    def by_key(key):
+        if index and key in index:
+            return index[key]
+        for node in tree.keys():
+            if node.key == key:
+                return node
+        return None
+
+    if req.dist:
+        return req.dist
+    # The DistPackage is probably missing repair the tree if necessary
+    dist = by_key(req.key)
+    if dist is None:
+        dist = MissingPackage().from_req(req=req)
+        tree[dist] = []
+    req.dist = dist
+    return dist
+
+
+class TreeWalker(object):
+    """Helper to walk up or down the tree yielding ReqPackages & DistPackages.
+    Walks from the supplied package returning:
+        req - the ReqPackage view of the current package
+        dist - the DistPackage view of the current package
+        stack - the list of keys on the branch from the start to the current package
+    """
+
+    def __init__(self, tree, visit_once=False, reverse=False):
+        """Init the generator with the tree and index.
+
+        :param collections.OrderedDict tree: The Tree to walk
+        :param bool visit_once: Whether to only yield each node once overall
+        :param bool reverse: Whether to invert the tree and walk leaf to root
+        """
+        self._reverse = reverse
+        self._tree = tree
+        self._index = {p.key: p for p in self._tree}
+        if reverse:
+            self._rev_tree = reverse_tree(tree)
+            self._rev_index = {p.key: p for p in self._rev_tree}
+        self._visited = []
+        self.visit_once = visit_once
+
+    def forget_visited(self):
+        """Purge the visited list."""
+        self._visited = []
+
+    def walk(self, package):
+        """Walk the branches and leaves from the given package.
+
+        Yields all the branches and leaves below the given package,
+        not the package itself.
+
+        :param DistPackage package: The package to start from
+        :returns (ReqPackage, DistPackage, Stack): Both views of the package and stack
+        :rtype Tuple
+        """
+        # TODO - Change Yield Froms into Python2 compatible nastiness
+        branches = []
+        if self._reverse:
+            branches = list(self._reverse_walk(package=package, stack=[]))
+        else:
+            branches = list(self._normal_walk(package=package, stack=[]))
+        for (req, dist, stack) in branches:
+            yield (req, dist, stack)
+
+    def _check_visited(self, package):
+        """If in visit once mode, have we already been here?"""
+        if self.visit_once:
+            if package.key in self._visited:
+                return True
+            self._visited.append(package.key)
+        return False
+
+    @staticmethod
+    def _check_loop(package, stack):
+        """Detect loops and don't continue looping."""
+        if package.key in stack:
+            return True
+        stack.append(package.key)
+
+    def _normal_walk(self, package, stack):
+        """Walk in the 'normal' direction down the tree.
+        Add Missing packages to the tree if found."""
+        if self._check_loop(package=package, stack=stack):
+            return
+        for req in self._tree[package]:
+            if req.key not in self._visited:
+                if not self._check_visited(package=req):
+                    dist = _get_dist_package(
+                            self._tree, req=req, index=self._index)
+                    yield (req, dist, stack)
+                    leaves = list(self._normal_walk(package=dist, stack=stack.copy()))
+                    for (req, dist, stack) in leaves:
+                        yield (req, dist, stack)
+
+    def _reverse_walk(self, package, stack):
+        """Walk up the reversed tree. No missing packages."""
+        if self._check_loop(package=package, stack=stack):
+            return
+        package = self._rev_index.get(package.key, None)
+        if package is not None:
+            for pkg in self._rev_tree[package]:
+                # if pkg.key not in self._visited:
+                if not self._check_visited(package=pkg):
+                    req = self._rev_index[pkg.key]
+                    dist = self._index[pkg.key]
+                    yield (req, dist, stack)
+                    yield from self._reverse_walk(package=dist, stack=stack.copy())
+
+
+def dump_enhanced_graphviz(
+        tree, show_only=None, exclude=None, output_format='dot'):
+    """Output a filtered dependency graph, enhanced wrapper for dump_graphviz().
+
+    :param dict tree: dependency graph
+    :param set show_only: set of select packages to be shown in the
+                          output. This is optional arg, default: None.
+    :param set exclude: set of select packages to be excluded from the
+                          output. This is optional arg, default: None.
+    :param string output_format: output format
+    :returns: representation of tree in the specified output format
+    :rtype: str or binary representation depending on the output format
+    """
+    filtered_tree = filter_tree(tree=tree, show_only=show_only, exclude=exclude)
+    output = dump_graphviz(
+            tree=filtered_tree,
+            output_format=output_format,
+            enhanced_graph=True)
+    return output
+
+
+def _label_conflicted_packages(tree, package):
+    """Walk up the tree from a conflicted package and label affected packages.
+
+    :param collections.OrderedDict tree: The tree to walk
+    :param DistPackage package: The package to work from
+    """
+    if package.conflict_target:
+        walker = TreeWalker(tree=tree, visit_once=True, reverse=True)
+        for req, dist, stack in walker.walk(package=package):
+            dist.conflicted_reqs.add(package.project_name)
+
+
+def _mark_versions(tree, index=None):
+    """Work the tree, mark the various requested versions on each DistPackage.
+
+    :param collections.OrderedDict tree: The tree to process
+    :param dict index: The tree key index if available
+    """
+    for package, reqs in tree.items():
+        for req in reqs:
+            dist = req.dist or _get_dist_package(tree=tree, req=req, index=index)
+            if req.version_spec is not None:
+                dist.required_versions.add(req.version_spec)
+            if req.is_conflicting():
+                dist.conflict_target = True
+
+
+def _mark_roots(tree):
+    """Walks the tree and marks the root nodes as is_root=True.
+
+    A root is any package which is not required by another package.
+
+    :param tree (collections.OrderedDict): The DistPackage Tree to label
+    """
+    walker = TreeWalker(tree=tree, visit_once=True)
+    for pkg in list(tree.keys()):
+        for _, dist, _ in walker.walk(pkg):
+            dist.is_root = False
+
+
+def _mark_include_exclude(tree,
+                          show_only=None,
+                          exclude=None):
+    """Recursively marks the packages in the tree with include or exclude flags.
+    Marks top level exclusions
+    Only marks branch or leaf dependencies if it is not already actively
+    included by an include request.
+
+    :param collections.OrderedDict tree: The tree of DistPackage s to process
+    :param set show_only: set of select packages to be shown in the
+                          output. This is optional arg, default: None.
+    :param set exclude: set of select packages to be excluded from the
+                          output. This is optional arg, default: None.
+    """
+    nodes = list(tree.keys())
+    includes = []
+    excludes = []
+
+    # Filter the nodes based on the list of packages to include
+    if show_only:
+        includes = [p for p in nodes
+                    if p.key in show_only or p.project_name in show_only]
+    if exclude:
+        excludes = [p for p in tree.keys()
+                    if p.key in exclude or p.project_name in exclude]
+
+    walker = TreeWalker(tree=tree, visit_once=False)
+
+    # Mark nodes and branches the user included with -p
+    # Do not mark explicitly excluded nodes or their children
+    for package in includes:
+        package.include = True
+        for req, dist, stack in walker.walk(package=package):
+            if dist not in excludes:
+                if not any([pkg.key in stack for pkg in excludes]):
+                    dist.include = True
+
+    # Mark nodes and branches the user excluded with -e, avoid included branches
+    for package in excludes:
+        package.exclude = True
+        for req, dist, stack in walker.walk(package=package):
+            if not dist.include:
+                dist.exclude = True
+
+    # If there were no explicit includes, mark everything except excluded branches
+    if not includes:
+        _mark_roots(tree=tree)
+        roots = [p for p in tree.keys() if p.is_root]
+        for package in roots:
+            # Need to walk down each branch, ask if we're on an exclude branch
+            if not package.exclude:
+                package.include = True
+                for req, dist, stack in walker.walk(package=package):
+                    if not any([pkg.key in stack for pkg in excludes]):
+                        if dist not in excludes:
+                            dist.include = True
+                            dist.exclude = False
+
+
+def filter_tree(tree, show_only=None, exclude=None):
+    """Filter the tree using packages and exclude lists for graph rendering.
+    Walk the tree and label the packages affected by conflicts.
+
+    :param dict tree: The tree to filter
+    :param set show_only: set of select packages to be shown in the
+                          output. This is optional arg, default: None.
+    :param set exclude: set of select packages to be excluded from the
+                          output. This is optional arg, default: None.
+    :returns tree: The input tree, filtered
+    :rtype collections.OrderedDict
+    """
+    tree = sorted_tree(tree)
+    _mark_include_exclude(tree=tree, show_only=show_only, exclude=exclude)
+
+    # Prune the tree, prune packages, then dependencies (or they reappear in the graph)
+    for package in list(tree.keys()):
+        if not package.include or package.exclude:
+            del tree[package]
+
+    keys = [package.key for package in tree]
+    for dist, deps in tree.items():
+        tree[dist] = [dep for dep in deps if dep.key in keys]
+
+    local_index = {p.key: p for p in tree.keys()}
+    _mark_versions(tree=tree, index=local_index)
+
+    for package in list(tree.keys()):
+        _label_conflicted_packages(package=package, tree=tree)
+
+    return tree
+
+
+def build_package_tree(tree):
+    """Builds up a traversable PackageTree of the Dist and Req Packages."""
+    package_tree = PackageTree()
+    for dist in tree.keys():
+        package_tree.add_package(dist_package=dist)
+    for dist, reqs in tree.items():
+        package_tree.add_requirements(dist_package=dist, req_packages=reqs)
+    return package_tree
+
+
+class PackageTree:
+    """Traversable tree wrapper for the Distribution and Requirement packages."""
+
+    def __init__(self):
+        self._nodes = {}
+
+    def add_package(self, dist_package):
+        """Add a package node to the tree.
+
+        :param DistPackage dist_package: The DistPackage to add to the tree
+        """
+        if dist_package.key in self._nodes:
+            raise KeyError('DistPackage {0} already in tree'.format(dist_package.key))
+        self._nodes[dist_package.key] = TreeNode(dist_package)
+
+    def add_requirements(self, dist_package, req_packages):
+        """Add the requirement edges to the distribution nodes.
+
+        :param DistPackage dist_package: The DistPackage to add edges from
+        :param list req_packages: The ReqPackages of this DistPackage
+        """
+        if req_packages:
+            source_node = self._nodes[dist_package.key]
+
+            for req in req_packages:
+                if req.key not in self._nodes:
+                    # TODO - Insert MissingPackage builder here
+                    raise KeyError('No node found for ReqPackage: {0}'.format(req.key))
+                target_node = self._nodes[req.key]
+                source_node.add_requirement(req_package=req, target_node=target_node)
+                target_node.add_required_by(source_node=source_node)
+
+    def get_nodes(self):
+        """Get a list of all node keys.
+
+        :returns list: A list of the node keys
+        """
+        return self._nodes.keys()
+
+    def get_node(self, key):
+        """Get a TreeNode by it's key.
+
+        :returns TreeNode: The node with the matching key
+        """
+        return self._nodes[key]
+
+    def roots(self):
+        """Returns the keys of all the root nodes.
+
+        :returns list: A list of node keys
+        """
+        return [key for key, node in self._nodes.items() if node.is_root]
+
+    def leaves(self):
+        """Returns the keys of all the leaf nodes.
+
+        :returns list: A list of node keys
+        """
+        return [key for key, node in self._nodes.items() if node.is_leaf]
+
+    def delete(self, key):
+        """Delete a specified node by key.
+        Deletes the node and the requirements edges that point to it.
+
+        :param str: The key of the node to delete
+        """
+        target_node = self._nodes[key]
+        for impacted in target_node.required_by:
+            impacted.delete_requirement(key)
+        for impacted in target_node.requirements.values():
+            impacted.delete_required_by(target_node)
+        del self._nodes[key]
+
+
+class TreeNode:
+    """Package node for the Tree."""
+
+    def __init__(self, dist_package):
+        """A PackageTree Node container for a DistPackage and it's ReqPackages.
+
+        :param DistPackage dist_package: The DistPackage to wrap
+        """
+        if not isinstance(dist_package, DistPackage):
+            raise TypeError('TreeNode requires DistPackages')
+        self._dist_package = dist_package
+        self.key = dist_package.key
+        self.requirements = {}
+        self.required_by = []
+        self.include = False
+        self.exclude = False
+
+    @property
+    def dist_package(self):
+        """Returns the DistPackage.
+
+        :returns DistPackage
+        """
+        return self._dist_package
+
+    def add_requirement(self, req_package, target_node):
+        """Adds a requirement edge to the graph.
+
+        :param ReqPackage req_package: The requirement package to add to the graph
+        :param TreeNode target_node: The TreeNode containing the target DistPackage
+        """
+        if not req_package in self.requirements:
+            self.requirements[req_package] = target_node
+
+    def delete_requirement(self, key):
+        """Delete a requirement edge from the graph."""
+        for req in list(self.requirements.keys()):
+            if req.key == key:
+                del self.requirements[req]
+
+    def add_required_by(self, source_node):
+        """Adds a required by backward edge to the graph.
+
+        :param TreeNode source_node: The source node requiring this node
+        """
+        self.required_by.append(source_node)
+
+    def delete_required_by(self, node):
+        """Delete a required by edge from the graph.
+
+        :param TreeNode node: The node to remove
+        """
+        if node in self.required_by:
+            self.required_by.remove(node)
+
+    @property
+    def is_root(self):
+        """Is this node a 'root' in the tree? i.e. is not a Requirement of any other.
+
+        :returns bool
+        """
+        return len(self.required_by) == 0
+
+    @property
+    def is_leaf(self):
+        """Is this node a 'leaf' in the tree? i.e. is not required by any other.
+
+        :returns bool
+        """
+        return len(self.requirements) == 0
+
+    def get_requirements(self, req=None, stack=None):
+        """Recursively gets a list of tuples of the requirements below this node.
+
+        :param ReqPackage req: The requirement package that requires this node
+        :param list stack: The node key stack to get to here
+        :returns list: Tuples of (DistPackage, ReqPackage, stack)
+        """
+        stack = stack or []
+        if self.key in stack:
+            return                  # Exit circular dependencies
+        stack.append(self.key)
+        yield (req, self.dist_package, stack)
+        for req, node in self.requirements.items():
+            for req, inner_node, inner_stack in node.get_requirements(
+                    req=req, stack=stack.copy()):
+                yield (req, inner_node, inner_stack)
+
+
+########################################################################################
 
 
 def render_tree(tree, list_all=True, show_only=None, frozen=False, exclude=None):
@@ -400,12 +895,68 @@ def render_json_tree(tree, indent):
 
     return json.dumps([aux(p) for p in nodes], indent=indent)
 
+def _node_style(package):
+    """Style the graphviz node for enhanced graph based on the package info."""
 
-def dump_graphviz(tree, output_format='dot'):
+    def build_label():
+        """Builds long descriptive label for enhanced graph."""
+        label = [package.project_name,
+                 'Ver: {0}'.format(package.version)]
+        if package.required_versions:
+            label.append('Req: {0}'.format(required_versions))
+        if package.conflicted_reqs:
+            label.append(
+                    'Conflicted: {0}'.format(conflicted_reqs))
+        return '\n'.join(label)
+
+    style = {}
+    required_versions = ', '.join(package.required_versions)
+    conflicted_reqs = '\n'.join(package.conflicted_reqs)
+
+    style['label'] = build_label()
+    style['project_name'] = package.project_name
+    style['version'] = str(package.version)
+    style['required_versions'] = required_versions
+
+    if package.conflicted_reqs:
+        style['conflicted_reqs'] = conflicted_reqs
+        style['color'] = 'khaki'
+        style['style'] = 'filled'
+
+    if package.conflict_target:
+        style['color'] = 'orange'
+        style['style'] = 'filled'
+        style['conflict_target'] = 'True'
+
+    if package.version == 'MISSING':
+        style['missing'] = 'True'
+        style['color'] = 'red'
+        style['style'] = 'filled'
+        style['fontcolor'] = 'white'
+
+    return style
+
+
+def _edge_style(dep):
+    """Style the graph edges for enhanced graph."""
+    style = {}
+    if dep.is_conflicting():
+        style['color'] = 'orange'
+        style['fontcolor'] = 'orange'
+        style['conflict'] = 'True'
+    if dep.is_missing:
+        style['color'] = 'red'
+        style['fontcolor'] = 'red'
+        style['missing'] = 'True'
+    return style
+
+
+def dump_graphviz(tree, output_format='dot', enhanced_graph=False):
     """Output dependency graph as one of the supported GraphViz output formats.
 
     :param dict tree: dependency graph
     :param string output_format: output format
+    :param bool enhanced_graph: Add the graph extras
     :returns: representation of tree in the specified output format
     :rtype: str or binary representation depending on the output format
 
@@ -425,15 +976,25 @@ def dump_graphviz(tree, output_format='dot'):
         sys.exit(1)
 
     graph = Digraph(format=output_format)
+
     for package, deps in tree.items():
-        project_name = package.project_name
-        label = '{0}\n{1}'.format(project_name, package.version)
-        graph.node(project_name, label=label)
+        # Case insensitive package names, https://www.python.org/dev/peps/pep-0426/#name
+        key = package.key.lower()
+        label = '{0}\n{1}'.format(package.project_name, package.version)
+        # Add more attributes to the graph nodes
+        if enhanced_graph:
+            node_style = _node_style(package)
+            graph.node(key, **node_style)
+        else:
+            graph.node(key, label=label)
+
         for dep in deps:
-            label = dep.version_spec
-            if not label:
-                label = 'any'
-            graph.edge(project_name, dep.project_name, label=label)
+            label = dep.version_spec or 'any'
+            if enhanced_graph:
+                edge_style = _edge_style(dep)
+                graph.edge(key, dep.key, label=label, **edge_style)
+            else:
+                graph.edge(key, dep.key, label=label)
 
     # Allow output of dot format, even if GraphViz isn't installed.
     if output_format == 'dot':
@@ -561,6 +1122,13 @@ def get_parser():
                             'format. Available are all formats supported by '
                             'GraphViz, e.g.: dot, jpeg, pdf, png, svg'
                         ))
+    parser.add_argument('-n', '--enhanced-graph', action='store_true', default=False,
+                        help=(
+                            'Add enhanced graph features to graph output, '
+                            'color labelling for missing and conflicting dependencies, '
+                            'additional graph metadata (e.g. for Gephi rendering), '
+                            'labels for required versions.'
+                        ))
     return parser
 
 
@@ -577,6 +1145,9 @@ def main():
     dist_index = build_dist_index(pkgs)
     tree = construct_tree(dist_index)
 
+    show_only = set(args.packages.split(',')) if args.packages else None
+    exclude = set(args.exclude.split(',')) if args.exclude else None
+
     if args.json:
         print(render_json(tree, indent=4))
         return 0
@@ -584,7 +1155,14 @@ def main():
         print(render_json_tree(tree, indent=4))
         return 0
     elif args.output_format:
-        output = dump_graphviz(tree, output_format=args.output_format)
+        if args.enhanced_graph:
+            output = dump_enhanced_graphviz(
+                    tree,
+                    show_only=show_only,
+                    exclude=exclude,
+                    output_format=args.output_format)
+        else:
+            output = dump_graphviz(tree, output_format=args.output_format)
         print_graphviz(output)
         return 0
 
@@ -617,9 +1195,6 @@ def main():
 
         if args.warn == 'fail' and (conflicting or cyclic):
             return_code = 1
-
-    show_only = set(args.packages.split(',')) if args.packages else None
-    exclude = set(args.exclude.split(',')) if args.exclude else None
 
     if show_only and exclude and (show_only & exclude):
         print('Conflicting packages found in --packages and --exclude lists.', file=sys.stderr)
